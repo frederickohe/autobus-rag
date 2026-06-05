@@ -76,7 +76,7 @@ volumes:
 
 networks:
   rag_net:
-    driver: bridge
+    external: true
     name: greenbrain_rag
   caddy:
     external: true
