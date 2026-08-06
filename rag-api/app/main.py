@@ -60,6 +60,9 @@ class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1)
     limit: int = Field(default=5, ge=1, le=50)
     score_threshold: Optional[float] = Field(default=None)
+    # When set, only return points whose metadata.source is one of these
+    # (e.g. document / website). Omit to search all tenant points.
+    sources: Optional[List[str]] = None
 
 
 class QueryHit(BaseModel):
@@ -83,15 +86,27 @@ class DeleteRequest(BaseModel):
     file_name: Optional[str] = None
 
 
-def _tenant_filter(tenant_id: str) -> qm.Filter:
-    return qm.Filter(
-        must=[
-            qm.FieldCondition(
-                key="tenant_id",
-                match=qm.MatchValue(value=tenant_id),
+def _tenant_filter(
+    tenant_id: str,
+    *,
+    sources: Optional[List[str]] = None,
+) -> qm.Filter:
+    must: list[qm.Condition] = [
+        qm.FieldCondition(
+            key="tenant_id",
+            match=qm.MatchValue(value=tenant_id),
+        )
+    ]
+    if sources:
+        cleaned = [s.strip() for s in sources if s and str(s).strip()]
+        if cleaned:
+            must.append(
+                qm.FieldCondition(
+                    key="metadata.source",
+                    match=qm.MatchAny(any=cleaned),
+                )
             )
-        ]
-    )
+    return qm.Filter(must=must)
 
 
 def _delete_filter(
@@ -253,7 +268,7 @@ async def query_points(body: QueryRequest) -> QueryResponse:
         query_vector=vec,
         limit=body.limit,
         score_threshold=body.score_threshold,
-        query_filter=_tenant_filter(body.tenant_id),
+        query_filter=_tenant_filter(body.tenant_id, sources=body.sources),
         with_payload=True,
     )
 
