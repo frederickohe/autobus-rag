@@ -19,7 +19,7 @@ from app.settings import settings
 logger = logging.getLogger("rag_api")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Greenbrain RAG API", version="0.1.0")
+app = FastAPI(title="Greenbrain RAG API", version="0.2.0")
 
 _qdrant: Optional[QdrantClient] = None
 
@@ -74,6 +74,15 @@ class QueryResponse(BaseModel):
     hits: List[QueryHit]
 
 
+class DeleteRequest(BaseModel):
+    tenant_id: str = Field(..., min_length=1, max_length=256)
+    # When set, only remove points whose metadata.source is one of these values
+    # (e.g. document / website). Omit to delete all points for the tenant.
+    sources: Optional[List[str]] = None
+    object_key: Optional[str] = None
+    file_name: Optional[str] = None
+
+
 def _tenant_filter(tenant_id: str) -> qm.Filter:
     return qm.Filter(
         must=[
@@ -83,6 +92,45 @@ def _tenant_filter(tenant_id: str) -> qm.Filter:
             )
         ]
     )
+
+
+def _delete_filter(
+    tenant_id: str,
+    *,
+    sources: Optional[List[str]] = None,
+    object_key: Optional[str] = None,
+    file_name: Optional[str] = None,
+) -> qm.Filter:
+    must: list[qm.Condition] = [
+        qm.FieldCondition(
+            key="tenant_id",
+            match=qm.MatchValue(value=tenant_id),
+        )
+    ]
+    if sources:
+        cleaned = [s.strip() for s in sources if s and str(s).strip()]
+        if cleaned:
+            must.append(
+                qm.FieldCondition(
+                    key="metadata.source",
+                    match=qm.MatchAny(any=cleaned),
+                )
+            )
+    if object_key and object_key.strip():
+        must.append(
+            qm.FieldCondition(
+                key="metadata.object_key",
+                match=qm.MatchValue(value=object_key.strip()),
+            )
+        )
+    if file_name and file_name.strip():
+        must.append(
+            qm.FieldCondition(
+                key="metadata.file_name",
+                match=qm.MatchValue(value=file_name.strip()),
+            )
+        )
+    return qm.Filter(must=must)
 
 
 async def _embed_texts(client: httpx.AsyncClient, texts: List[str]) -> List[List[float]]:
@@ -198,7 +246,7 @@ async def query_points(body: QueryRequest) -> QueryResponse:
     qc = get_qdrant()
     async with httpx.AsyncClient() as http:
         vectors = await _embed_texts(http, [body.query])
-    vec = vectors[0]
+        vec = vectors[0]
 
     res = qc.search(
         collection_name=settings.rag_collection_name,
@@ -224,3 +272,33 @@ async def query_points(body: QueryRequest) -> QueryResponse:
             )
         )
     return QueryResponse(hits=hits)
+
+
+@app.post("/v1/points/delete", dependencies=[Depends(verify_api_key)])
+async def delete_points(body: DeleteRequest) -> dict[str, Any]:
+    """Delete tenant-scoped points, optionally limited to document/website intelligence."""
+    qc = get_qdrant()
+    filt = _delete_filter(
+        body.tenant_id,
+        sources=body.sources,
+        object_key=body.object_key,
+        file_name=body.file_name,
+    )
+    # Count matching points first (best-effort) for a useful response.
+    deleted = 0
+    try:
+        counted = qc.count(
+            collection_name=settings.rag_collection_name,
+            count_filter=filt,
+            exact=True,
+        )
+        deleted = int(getattr(counted, "count", 0) or 0)
+    except Exception as e:
+        logger.warning("count before delete failed: %s", e)
+
+    qc.delete(
+        collection_name=settings.rag_collection_name,
+        points_selector=qm.FilterSelector(filter=filt),
+        wait=True,
+    )
+    return {"deleted": deleted}
